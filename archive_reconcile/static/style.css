@@ -148,3 +148,16 @@ tr.kind-changed td:nth-child(2) { color: var(--accent); font-weight: 500; }
 tr.current td { font-weight: 600; }
 
 .muted-card { background: #fbfcfd; }
+
+.search-bar { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+.search-form { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+.search-form .search-field { display: grid; gap: 4px; font-size: 13px; color: var(--muted); flex: 1 1 320px; }
+.search-form input[type="search"], .search-form input[type="text"] {
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; font: inherit; width: 100%;
+}
+.inline-form { display: inline; margin: 0; }
+.search-results .search-empty { margin: 8px 0 14px; }
+.uncertain-notice { font-weight: 600; color: var(--warn); }
+.search-hits td a { font-weight: 500; }
+.pending-boxes { margin-top: 14px; padding-top: 10px; border-top: 1px dashed var(--line); }
+.flash-warning { background: #fdf6e6; border-color: #ecd49c; color: #6f4a06; }

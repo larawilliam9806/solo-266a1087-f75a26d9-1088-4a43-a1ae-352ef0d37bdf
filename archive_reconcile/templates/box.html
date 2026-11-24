@@ -8,6 +8,7 @@
       <a href="{{ url_for('board', batch_id=batch.id) }}">← 返回批次 #{{ batch.id }} 分盒清单</a>
       · <span class="status">{{ box.status_label }}</span>
       {% if box.finalized %}<span class="pill pill-done">已确认</span>{% endif %}
+      {% if box_index_info %}<span class="pill pill-ok" title="该盒已有核实依据，题录已收入题名片段检索索引（同盒只收录一次，换交不撤销）">已入题名索引</span>{% endif %}
     </p>
   </div>
 </div>

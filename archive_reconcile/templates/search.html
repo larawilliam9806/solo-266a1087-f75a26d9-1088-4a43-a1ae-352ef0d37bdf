@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}题名检索 · 批次 #{{ batch.id }}{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>批次 #{{ batch.id }} · {{ batch.label }} · 题名检索</h1>
+    <p class="muted">
+      <a href="{{ url_for('board', batch_id=batch.id) }}">← 返回分盒对账看板</a>
+    </p>
+  </div>
+  <div class="actions">
+    <form method="post" action="{{ url_for('rebuild_index', batch_id=batch.id) }}">
+      {% if q %}<input type="hidden" name="q" value="{{ q }}">{% endif %}
+      <button class="ghost" type="submit"
+              title="扫描核验通过的旧库明细与全部历史题录版本，补建/补齐分盒索引，可重复执行">
+        补建索引
+      </button>
+    </form>
+  </div>
+</div>
+
+<section class="card" id="title-search">
+  <h2>按题名片段搜索 / 查询已核实档案</h2>
+  <form method="get" action="{{ url_for('search_batch', batch_id=batch.id) }}" class="search-form" role="search">
+    <label class="search-field" for="q">题名片段
+      <input id="q" type="search" name="q" value="{{ q or '' }}" autofocus
+             placeholder="输入题名中的一段文字，例如：关于甲" aria-label="题名片段">
+    </label>
+    <button type="submit">搜索</button>
+    {% if q %}
+    <a class="button ghost" href="{{ url_for('search_batch', batch_id=batch.id) }}">清空</a>
+    {% endif %}
+  </form>
+  <p class="hint">
+    索引只收录有核实依据的旧库题录：① 通过清单条数与 SHA-256 核验的回传明细；
+    ② 任一版条数与摘要均同旧库清单相符的新库题录；③ 清单中零条的盒（视为已查）。
+    同盒只收录一次，后续换交不撤销已证实的旧题录。补建幂等可重试、失败整体回滚，
+    搜索不显示未建完的索引。
+  </p>
+  <p class="index-status muted">
+    当前索引：已覆盖 <strong>{{ search.indexed_boxes|length }}</strong> 盒 /
+    {{ search.entry_count }} 条题录，
+    待查盒 <strong>{{ search.pending_boxes|length }}</strong> 个。
+    {% if index_status.ready %}<span class="pill pill-done">索引已开放</span>
+    {% else %}<span class="pill pill-warn">索引可补建/重试</span>{% endif %}
+  </p>
+  {% if index_status.state and index_status.state.status == 'failed' %}
+  <p class="flash flash-error index-error" role="alert">
+    上次补建索引失败{% if index_status.state.last_error %}：{{ index_status.state.last_error }}{% endif %}。
+    未建完的索引不会作为完整结果展示（搜索不显示未建完的索引）；原对账功能照常可用，可点击“补建索引”重试。
+  </p>
+  {% endif %}
+</section>
+
+{% include "_search_results.html" %}
+{% endblock %}

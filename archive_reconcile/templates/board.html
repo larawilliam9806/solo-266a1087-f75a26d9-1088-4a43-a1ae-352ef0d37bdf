@@ -35,6 +35,47 @@
   <div class="stat"><span class="num">{{ board.counts.finalized }}</span><span>已确认盒</span></div>
 </section>
 
+<section class="card" id="title-search">
+  <h2>档案检索 · 按题名片段查已核实题录</h2>
+  <div class="search-bar">
+    <form method="get" action="{{ url_for('search_batch', batch_id=batch.id) }}" class="search-form" role="search">
+      <label class="search-field">题名片段
+        <input type="search" name="q" value="{{ q or '' }}"
+               placeholder="例如：关于甲的报告" aria-label="题名片段">
+      </label>
+      <button type="submit">搜索</button>
+    </form>
+    <form method="post" action="{{ url_for('rebuild_index', batch_id=batch.id) }}" class="inline-form">
+      {% if q %}<input type="hidden" name="q" value="{{ q }}">{% endif %}
+      <button class="ghost" type="submit"
+              title="读取核验通过的旧库明细与历史题录版本补建索引，可重试">补建索引</button>
+    </form>
+    <a class="button ghost" href="{{ url_for('search_batch', batch_id=batch.id) }}">检索页</a>
+  </div>
+  <p class="hint">
+    搜索直接读已提交的分盒索引；命中与待查盒来自同一份数据。索引依据：核验通过的旧库明细，
+    或条数、摘要均与清单相符的任一版新库题录；零条盒视为已查。
+    当前待查盒 <strong>{{ index_status.pending_count }}</strong> 个，
+    已覆盖 {{ index_status.covered_count }} 盒。
+    {% if index_status.ready %}<span class="pill pill-done">索引已开放</span>
+    {% else %}<span class="pill pill-warn" title="可点“补建索引”扫描历史题录后开放检索">索引尚未开放（可补建）</span>{% endif %}
+  </p>
+</section>
+
+{% if index_status.pending_boxes %}
+<section class="card callout" id="index-pending">
+  <h2>检索待查盒（{{ index_status.pending_boxes|length }}）</h2>
+  <p class="box-line">
+    {% for box_no in index_status.pending_boxes %}
+      <a class="box-chip chip-danger" href="{{ url_for('box_detail', batch_id=batch.id, box_no=box_no) }}">{{ box_no }}</a>
+    {% endfor %}
+  </p>
+  <p class="hint">这些盒尚无核实依据（无核验通过的明细，也没有条数与摘要同清单相符的历史版本），其旧库题录暂不能检索。</p>
+</section>
+{% endif %}
+
+{% if search is not none %}{% include "_search_results.html" %}{% endif %}
+
 {% if board.needs_detail %}
 <section class="card callout">
   <h2>须回旧库调明细的盒（{{ board.needs_detail|length }}）</h2>

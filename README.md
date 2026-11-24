@@ -18,6 +18,41 @@
 7. 若提交结果时该盒内容已变（页面过期/并发），拒绝保存本次结果。
 8. 换交或核对失败时，原有数据和仍有效的结论保持不变。
 
+## 已核实题名检索（分盒索引）
+
+档案员不必逐盒调明细才能找档。批次页可**补建索引**并按**题名片段**查询：
+
+- 结果列出命中的**盒号、档号、题名、保管期限**，同时列出**待查盒**。
+- 无命中且仍有待查盒时，明确提示“**尚不能确认是否存在**”；全部清单盒查完后
+  无命中，才可确认已核实范围内不存在。
+- 入索引的依据（任一即可，均须可核实）：
+  1. 通过清单条数 + SHA-256 核验的回传旧库明细；
+  2. **任一历史版本**新库题录的条数和摘要都与旧库清单相符（摘要相符即内容一致）；
+  3. 清单中条数为 `0` 的盒——零条盒直接视为已查。
+- 同盒只收录一次（`indexed_boxes` 每盒一行、`title_index` 每档号一行，
+  `INSERT OR IGNORE` 去重）；后续换交只追加新版本，**不删除/不撤销**已证实的旧题录。
+- 发现首份依据时，分盒索引在 `submit_detail` / `import_snapshot` 的**同一事务**
+  内入账；因此回传、换交被并发/校验拒绝时，索引写入一并回滚。
+- 搜索只读取 `title_index`，命中与待查盒在同一个只读事务快照中计算。
+- “补建索引”幂等可重试：单事务扫描全部清单盒与全部历史版本，失败整体回滚并记录
+  `search_index_state=failed`，原对账功能不受影响；重试成功后才置为 `ready`。
+- 补建只写新索引表，不阻断换交/回传（SQLite WAL + `BEGIN IMMEDIATE` 短事务），
+  归档批次也可查询和补建。
+
+HTTP：
+
+```text
+GET  /batches/<id>/search?q=题名片段      # 检索页（q/query/fragment/keyword 均可）
+GET  /batches/<id>?q=...                  # 批次页内联结果
+POST /batches/<id>/index/rebuild          # 补建/重试（幂等，完成后 302）
+GET  /batches/<id>/search.json?q=...      # JSON 结果（hits + pending_boxes 等）
+GET  /search?q=...                        # 跨批次全局检索
+```
+
+存储层对应 `Store.search_index` / `Store.rebuild_index` / `Store.pending_boxes`
+（并提供 `search_titles`、`backfill_index`、`build_index`、`unchecked_boxes`
+等同义方法）。
+
 ## 摘要口径
 
 摘要必须对行序和等价 CSV 写法不敏感。实现见
@@ -101,6 +136,10 @@ B1,3,<64 位十六进制>
 - `old_details`：通过清单校验的旧库明细。清单不变则明细长期有效，因此换交后能
   立刻用同一份明细重新比较。
 - `reconciliations` / `differences`：每盒一条结论 + 按档号的差异行。
+- `indexed_boxes` / `title_index` / `search_index_state`：已核实依据驱动的分盒
+  题名索引。`indexed_boxes` 记录每盒唯一的收录依据（`detail` / `version` /
+  `empty`），`title_index` 保存已证实的旧题录且不随换交删除；`search_index_state`
+  记录补建状态（`building` / `ready` / `failed`）。
 - 保存结论时以 `expected_version_id`（页面渲染时看到的版本）做乐观并发校验；
   不匹配抛 `StaleBoxError`，事务回滚，409 返回并保留原有数据。
 - 明细先校验条数与摘要，再落库；不符则抛 `ManifestMismatchError`，不写任何行。
@@ -113,9 +152,10 @@ archive_reconcile/
   canonical.py        CSV 解析、文本规范化、盒摘要
   export_manifest.py  旧库端清单导出 CLI
   reconcile.py        清单校验与逐档号比较规则
-  store.py            SQLite 模式与事务化存储
-  views.py            看板投影
-  templates/          Jinja 模板
+  search.py           题名检索/补建索引的函数式入口（核心逻辑在 store.Store）
+  store.py            SQLite 模式与事务化存储（含分盒索引与检索）
+  views.py            看板投影与检索投影
+  templates/          Jinja 模板（含 search.html、_search_results.html）
   static/style.css    样式
 tests/                规范化、清单校验、并发/换交/失败保留等测试
 ```

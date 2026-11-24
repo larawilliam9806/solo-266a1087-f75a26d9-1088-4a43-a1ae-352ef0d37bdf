@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}全批次题名检索{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div><h1>全批次 · 已核实题名检索</h1>
+    <p class="muted"><a href="{{ url_for('index') }}">← 返回批次列表</a></p>
+  </div>
+</div>
+<section class="card">
+  <form method="get" action="{{ url_for('global_search') }}" class="search-form" role="search">
+    <label class="search-field">题名片段
+      <input type="search" name="q" value="{{ q or '' }}" autofocus placeholder="输入题名片段" aria-label="题名片段">
+    </label>
+    <button type="submit">查询</button>
+  </form>
+</section>
+{% if q %}
+<section class="card">
+  <h2>命中（{{ hits|length }}）</h2>
+  {% if hits %}
+  <table class="board">
+    <thead><tr><th>批次</th><th>盒号</th><th>档号</th><th>题名</th><th>保管期限</th></tr></thead>
+    <tbody>
+      {% for hit in hits %}
+      <tr>
+        <td><a href="{{ url_for('board', batch_id=hit.batch_id) }}">#{{ hit.batch_id }}</a></td>
+        <td><a href="{{ url_for('box_detail', batch_id=hit.batch_id, box_no=hit.box_no) }}">{{ hit.box_no }}</a></td>
+        <td class="mono">{{ hit.archive_id }}</td>
+        <td>{{ hit.title }}</td>
+        <td>{{ hit.retention }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">所有批次的已核实索引中均无命中。各批次内若仍有待查盒，尚不能确认是否存在，请到对应批次页查看待查盒。</p>
+  {% endif %}
+</section>
+{% endif %}
+{% endblock %}

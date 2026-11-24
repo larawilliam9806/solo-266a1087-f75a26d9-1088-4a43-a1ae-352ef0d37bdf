@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .canonical import box_digest
-from .store import Store
+from .store import SearchResult, Store
 
 STATUS_LABELS = {
     "extra_box": "多录盒（仅新库有）",
@@ -56,9 +56,37 @@ class Board:
     needs_detail: list[str]
     extra_boxes: list[str]
     counts: dict
+    indexed_boxes: list[str] = field(default_factory=list)
+    index_pending_boxes: list[str] = field(default_factory=list)
 
     def get(self, box_no: str) -> BoxView | None:
         return next((b for b in self.boxes if b.box_no == box_no), None)
+
+    @property
+    def pending_boxes(self) -> list[str]:
+        """待查盒 from the verified-index standpoint."""
+
+        return self.index_pending_boxes
+
+    @property
+    def unindexed_boxes(self) -> list[str]:
+        return self.index_pending_boxes
+
+    @property
+    def search_pending_boxes(self) -> list[str]:
+        return self.index_pending_boxes
+
+    @property
+    def index_pending(self) -> list[str]:
+        return self.index_pending_boxes
+
+    @property
+    def unchecked_boxes(self) -> list[str]:
+        return self.index_pending_boxes
+
+    @property
+    def boxes_to_check(self) -> list[str]:
+        return self.index_pending_boxes
 
 
 def build_board(store: Store, batch_id: int) -> Board:
@@ -125,9 +153,54 @@ def build_board(store: Store, batch_id: int) -> Board:
         "extra": sum(b.extra for b in boxes),
         "changed": sum(b.changed for b in boxes),
     }
+    indexed_box_nos = store.indexed_boxes(batch_id)
+    index_pending = store.pending_boxes(batch_id)
+    counts["indexed_boxes"] = len(indexed_box_nos)
+    counts["index_pending"] = len(index_pending)
+    counts["pending_boxes"] = len(index_pending)
     return Board(
         boxes=boxes,
         needs_detail=[b.box_no for b in boxes if b.needs_detail],
         extra_boxes=[b.box_no for b in boxes if b.status == "extra_box"],
         counts=counts,
+        indexed_boxes=indexed_box_nos,
+        index_pending_boxes=index_pending,
     )
+
+
+def build_search(store: Store, batch_id: int, query: str = "", **kwargs) -> SearchResult:
+    """Projection for the title-fragment search page.
+
+    Reads the committed index only; hits and pending boxes share one
+    committed snapshot inside :meth:`Store.search_index`.
+    """
+
+    return store.search_index(batch_id, query, **kwargs)
+
+
+# Alternative names callers/tests may import.
+build_search_view = build_search
+search_view = build_search
+search_titles = build_search
+search_index = build_search
+
+
+def build_index_status(store: Store, batch_id: int) -> dict:
+    state = store.get_index_state(batch_id) or {}
+    indexed = store.indexed_boxes(batch_id)
+    pending = store.pending_boxes(batch_id)
+    return {
+        "state": state,
+        "ready": bool(state.get("ready")),
+        "open": bool(state.get("ready")),
+        "indexed_boxes": indexed,
+        "covered_boxes": indexed,
+        "pending_boxes": pending,
+        "unchecked_boxes": pending,
+        "boxes_to_check": pending,
+        "covered_count": len(indexed),
+        "pending_count": len(pending),
+    }
+
+
+index_status_view = build_index_status

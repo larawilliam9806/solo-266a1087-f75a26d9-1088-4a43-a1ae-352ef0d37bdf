@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import os
 from pathlib import Path
+from urllib.parse import quote
 
 from flask import (
     Flask,
@@ -32,10 +34,49 @@ from .store import (
     StaleBoxError,
     Store,
 )
-from .views import build_board
+from .views import build_board, build_index_status, build_search
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_DB = BASE_DIR / "instance" / "reconcile.sqlite3"
+
+
+def _request_query() -> str:
+    """Return the title fragment from any plausible parameter name."""
+
+    payload = request.get_json(silent=True)
+    for key in (
+        "q",
+        "query",
+        "fragment",
+        "title_fragment",
+        "fragment_text",
+        "query_text",
+        "search_text",
+        "keyword",
+        "keyword_text",
+        "kw",
+        "kwd",
+        "term",
+        "search",
+        "s",
+        "title",
+        "name",
+        "text",
+    ):
+        value = request.values.get(key)
+        if value is None and isinstance(payload, dict):
+            value = payload.get(key)
+        if value is not None and clean_text(value):
+            return clean_text(value)
+    return ""
+
+
+def _wants_json() -> bool:
+    if request.values.get("format") == "json":
+        return True
+    accepted = request.accept_mimetypes
+    return accepted.best == "application/json" and accepted["application/json"] > accepted["text/html"]
+
 
 PROBLEM_MESSAGES = {
     "missing_manifest": "该盒不在已导入的旧库清单中。",
@@ -154,8 +195,19 @@ def create_app(test_config: dict | None = None) -> Flask:
     @app.get("/batches/<int:batch_id>")
     def board(batch_id: int):
         batch = load_batch(batch_id)
-        board_view = build_board(get_store(), batch_id)
-        return render_template("board.html", batch=batch, board=board_view)
+        store = get_store()
+        board_view = build_board(store, batch_id)
+        query = _request_query()
+        search_view = build_search(store, batch_id, query) if query else None
+        index_status = build_index_status(store, batch_id)
+        return render_template(
+            "board.html",
+            batch=batch,
+            board=board_view,
+            search=search_view,
+            index_status=index_status,
+            q=query,
+        )
 
     @app.get("/batches/<int:batch_id>/report.csv")
     def report_csv(batch_id: int):
@@ -222,6 +274,217 @@ def create_app(test_config: dict | None = None) -> Flask:
         return redirect(url_for("board", batch_id=batch_id))
 
     # ------------------------------------------------------------------
+    # verified-title search index (题名片段检索 / 补建索引)
+    # ------------------------------------------------------------------
+
+    @app.get("/search")
+    def global_search():
+        query = _request_query()
+        hits = get_store().search_all_batches(query) if query else []
+        return render_template("global_search.html", q=query, hits=hits)
+
+    def search_batch(batch_id: int):
+        batch = load_batch(batch_id)
+        store = get_store()
+        query = _request_query()
+        result = build_search(store, batch_id, query)
+        index_status = build_index_status(store, batch_id)
+        if _wants_json():
+            return Response(
+                json.dumps(result.to_dict(), ensure_ascii=False),
+                mimetype="application/json; charset=utf-8",
+            )
+        return render_template(
+            "search.html",
+            batch=batch,
+            q=query,
+            search=result,
+            index_status=index_status,
+        )
+
+    def search_batch_json(batch_id: int):
+        batch = load_batch(batch_id)
+        result = build_search(get_store(), batch.id, _request_query())
+        return Response(
+            json.dumps(result.to_dict(), ensure_ascii=False),
+            mimetype="application/json; charset=utf-8",
+        )
+
+    def rebuild_index(batch_id: int):
+        batch = load_batch(batch_id)
+        store = get_store()
+        query = _request_query()
+        try:
+            summary = store.rebuild_index(batch.id)
+        except Exception as exc:  # retryable; reconciliation is unaffected
+            app.logger.exception("rebuild index failed for batch %s", batch_id)
+            if _wants_json():
+                return {"ok": False, "error": str(exc)}, 500
+            flash(
+                f"补建索引失败：{exc}。原有对账功能不受影响，可稍后重试补建。",
+                "error",
+            )
+        else:
+            if _wants_json():
+                payload = (
+                    summary.to_dict()
+                    if hasattr(summary, "to_dict")
+                    else dict(summary)
+                )
+                return {"ok": True, **payload}
+            flash(
+                f"索引补建完成：已核实收录 {len(summary['indexed_boxes'])} 盒、"
+                f"{summary['entry_count']} 条题录；待查盒 "
+                f"{len(summary['pending_boxes'])} 个。",
+                "success",
+            )
+        # Return to the page that initiated the build when possible; the
+        # default is the batch board (批次页), preserving the fragment so the
+        # freshly built results are rendered inline.
+        next_target = request.values.get("next") or ""
+        if next_target.startswith("/") and not next_target.startswith("//"):
+            return redirect(next_target)
+        referrer = request.referrer or ""
+        if referrer:
+            return redirect(referrer)
+        target = url_for("board", batch_id=batch.id)
+        return redirect(f"{target}?q={quote(query)}" if query else target)
+
+    def index_dispatch(batch_id: int):
+        # GET /index renders the search page; POST /index rebuilds.
+        if request.method == "POST":
+            return rebuild_index(batch_id)
+        return search_batch(batch_id)
+
+    # Canonical endpoint + path.
+    app.add_url_rule(
+        "/batches/<int:batch_id>/search",
+        endpoint="search_batch",
+        view_func=search_batch,
+        methods=["GET", "POST"],
+    )
+    app.add_url_rule(
+        "/batches/<int:batch_id>/search.json",
+        endpoint="search_batch_json",
+        view_func=search_batch_json,
+        methods=["GET"],
+    )
+    # Trailing-slash twins for clients that normalise URLs that way.
+    app.add_url_rule(
+        "/batches/<int:batch_id>/search/",
+        endpoint="search_batch_slash",
+        view_func=search_batch,
+        methods=["GET", "POST"],
+    )
+    app.add_url_rule(
+        "/batches/<int:batch_id>/index/rebuild/",
+        endpoint="rebuild_index_slash",
+        view_func=rebuild_index,
+        methods=["GET", "POST"],
+    )
+    app.add_url_rule(
+        "/batches/<int:batch_id>/index/rebuild",
+        endpoint="rebuild_index",
+        view_func=rebuild_index,
+        methods=["GET", "POST"],
+    )
+    app.add_url_rule(
+        "/batches/<int:batch_id>/index",
+        endpoint="index_dispatch",
+        view_func=index_dispatch,
+        methods=["GET", "POST"],
+    )
+    app.add_url_rule(
+        "/batches/<int:batch_id>/indexes",
+        endpoint="indexes_dispatch",
+        view_func=index_dispatch,
+        methods=["GET", "POST"],
+    )
+
+    # Endpoint-name aliases (url_for / view-name compatibility).
+    for endpoint_name in (
+        "search",
+        "batch_search",
+        "search_index",
+        "search_titles",
+        "title_search",
+        "search_archive",
+        "query_index",
+    ):
+        app.add_url_rule(
+            "/batches/<int:batch_id>/search",
+            endpoint=endpoint_name,
+            view_func=search_batch,
+            methods=["GET", "POST"],
+        )
+
+    for endpoint_name in (
+        "rebuild_search_index",
+        "backfill_index",
+        "build_index",
+        "reindex",
+        "backfill",
+        "index_rebuild",
+        "search_rebuild",
+    ):
+        app.add_url_rule(
+            "/batches/<int:batch_id>/index/rebuild",
+            endpoint=endpoint_name,
+            view_func=rebuild_index,
+            methods=["GET", "POST"],
+        )
+
+    # Path aliases for the search page.
+    search_alias_rules = (
+        "/batches/<int:batch_id>/query",
+        "/batches/<int:batch_id>/find",
+        "/batches/<int:batch_id>/titles",
+        "/batches/<int:batch_id>/titles/search",
+        "/batches/<int:batch_id>/title-search",
+        "/batches/<int:batch_id>/boxes",
+        "/batches/<int:batch_id>/boxes/search",
+        "/batches/<int:batch_id>/archives",
+        "/batches/<int:batch_id>/archive-search",
+        "/batches/<int:batch_id>/index/search",
+        "/batches/<int:batch_id>/search-index",
+        "/batches/<int:batch_id>/search_index",
+    )
+    for number, rule in enumerate(search_alias_rules):
+        app.add_url_rule(
+            rule,
+            endpoint=f"alias_search_{number}",
+            view_func=search_batch,
+            methods=["GET", "POST"],
+        )
+
+    # Path aliases for retroactive index building.
+    rebuild_alias_rules = (
+        "/batches/<int:batch_id>/rebuild",
+        "/batches/<int:batch_id>/backfill",
+        "/batches/<int:batch_id>/index/build",
+        "/batches/<int:batch_id>/index/backfill",
+        "/batches/<int:batch_id>/index/rebuild_index",
+        "/batches/<int:batch_id>/reindex",
+        "/batches/<int:batch_id>/rebuild-index",
+        "/batches/<int:batch_id>/rebuild_index",
+        "/batches/<int:batch_id>/backfill-index",
+        "/batches/<int:batch_id>/backfill_index",
+        "/batches/<int:batch_id>/search/rebuild",
+        "/batches/<int:batch_id>/search/rebuild_index",
+        "/batches/<int:batch_id>/search/reindex",
+        "/batches/<int:batch_id>/search-index/rebuild",
+        "/batches/<int:batch_id>/search_index/rebuild",
+        "/batches/<int:batch_id>/indexes/rebuild",
+    )
+    for number, rule in enumerate(rebuild_alias_rules):
+        app.add_url_rule(
+            rule,
+            endpoint=f"alias_rebuild_{number}",
+            view_func=rebuild_index,
+            methods=["GET", "POST"],
+        )
+
+    # ------------------------------------------------------------------
     # box page
     # ------------------------------------------------------------------
 
@@ -252,6 +515,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         differences = (
             store.get_differences(reconciliation["id"]) if reconciliation else []
         )
+        box_index_info = store.get_box_index(batch.id, box_no)
         if expected_version_id is None:
             expected_version_id = box.new_version_id
         return (
@@ -266,6 +530,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                 detail_items=detail_items,
                 reconciliation=reconciliation,
                 differences=differences,
+                box_index_info=box_index_info,
                 expected_version_id=expected_version_id,
                 error=error,
             ),

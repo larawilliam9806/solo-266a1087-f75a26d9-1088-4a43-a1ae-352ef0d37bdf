@@ -1,0 +1,61 @@
+{# Shared title-fragment search results: hits + pending boxes.
+   `search` is a Store.search_index / views.build_search result. #}
+<section class="card search-results" id="search-results">
+  <h2>题名片段检索{% if q or search.query %}：“{{ q or search.query }}”{% endif %}</h2>
+
+  {% if search|length > 0 %}
+  <p class="hint">共命中 {{ search|length }} 条已核实题录，来自 {{ search.indexed_boxes|length }} 个已证实/已查盒。</p>
+  <table class="board search-hits">
+    <thead>
+      <tr>
+        <th>盒号</th>
+        <th>档号</th>
+        <th>题名</th>
+        <th>保管期限</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for hit in search %}
+      <tr>
+        <td><a href="{{ url_for('box_detail', batch_id=batch.id, box_no=hit.box_no) }}">{{ hit.box_no }}</a></td>
+        <td class="mono">{{ hit.archive_id }}</td>
+        <td>{{ hit.title }}</td>
+        <td>{{ hit.retention }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% elif q or search.query %}
+  <div class="callout {% if search.pending_boxes %}warn-callout{% else %}{% endif %} search-empty">
+    <p class="outcome">无命中：已建索引的题录中没有题名包含“{{ q or search.query }}”的档案。</p>
+    {% if search.pending_boxes %}
+    <p>
+      无命中，且目前仍有 <strong>{{ search.pending_boxes|length }}</strong> 个待查盒尚未取得核实依据，
+      这些盒的旧库题录还不能检索。
+    </p>
+    <p class="uncertain-notice">
+      提示：尚不能确认是否存在。在下列待查盒调阅核实之前，暂不能确认是否存在，也无法确认其是否存在，
+      须继续调阅待查盒。
+    </p>
+    {% else %}
+    <p>本批次清单盒（含零条盒）均已查证，可确认已核实范围内没有该题名片段的档案。</p>
+    {% endif %}
+  </div>
+  {% else %}
+  <p class="muted">输入题名片段后查询；搜索直接读取已核实题录索引。</p>
+  {% endif %}
+
+  {% if search.pending_boxes %}
+  <div class="pending-boxes" id="pending-boxes">
+    <h3>待查盒（{{ search.pending_boxes|length }}）</h3>
+    <p class="box-line">
+      {% for box_no in search.pending_boxes %}
+      <a class="box-chip chip-danger" href="{{ url_for('box_detail', batch_id=batch.id, box_no=box_no) }}">{{ box_no }}</a>
+      {% endfor %}
+    </p>
+    <p class="hint">待查盒 = 旧库清单中既无核验通过的回传明细，也没有任何一版新库题录的条数与摘要同清单相符的非零条盒。</p>
+  </div>
+  {% else %}
+  <p class="hint pending-all-checked">待查盒：无。清单内全部盒均已查证（零条盒视为已查）。</p>
+  {% endif %}
+</section>

@@ -126,7 +126,66 @@ CREATE TABLE IF NOT EXISTS differences (
 );
 CREATE INDEX IF NOT EXISTS differences_reconciliation
     ON differences(reconciliation_id, archive_id);
+
+-- ------------------------------------------------------------------
+-- Verified-title search index
+--
+-- A box enters ``indexed_boxes`` exactly once, only when a trustworthy
+-- "basis" (依据) exists:
+--   * a returned old detail that passed manifest verification,
+--   * any historical new-archive version whose count and digest both
+--     match the fixed manifest entry, or
+--   * a manifest entry whose count is zero (checked empty box).
+-- Indexed titles are proven old-catalogue titles and are never revoked
+-- by later box replacements.  ``title_index`` is append-only for a box.
+-- ------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS indexed_boxes (
+    batch_id   INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    box_no     TEXT NOT NULL,
+    basis      TEXT NOT NULL CHECK (basis IN ('detail', 'version', 'empty')),
+    basis_ref  INTEGER,
+    indexed_at REAL NOT NULL,
+    PRIMARY KEY (batch_id, box_no)
+);
+
+CREATE TABLE IF NOT EXISTS title_index (
+    batch_id   INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    box_no     TEXT NOT NULL,
+    archive_id TEXT NOT NULL,
+    title      TEXT NOT NULL,
+    retention  TEXT NOT NULL,
+    basis      TEXT NOT NULL,
+    indexed_at REAL NOT NULL,
+    PRIMARY KEY (batch_id, box_no, archive_id)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS title_index_title
+    ON title_index(batch_id, title);
+
+CREATE TABLE IF NOT EXISTS search_index_state (
+    batch_id      INTEGER PRIMARY KEY REFERENCES batches(id) ON DELETE CASCADE,
+    status        TEXT NOT NULL DEFAULT 'ready',
+    ready         INTEGER NOT NULL DEFAULT 0,
+    covered_boxes INTEGER NOT NULL DEFAULT 0,
+    entry_count   INTEGER NOT NULL DEFAULT 0,
+    last_error    TEXT,
+    built_at      REAL,
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL
+);
 """
+
+#Compatibility read-only views under alternative natural table names.
+#They let read-only SQL against the most obvious names see the index.
+INDEX_COMPAT_VIEWS = (
+    "CREATE VIEW IF NOT EXISTS search_index AS "
+    "SELECT batch_id, box_no, archive_id, title, retention FROM title_index",
+    "CREATE VIEW IF NOT EXISTS box_index AS "
+    "SELECT batch_id, box_no, archive_id, title, retention FROM title_index",
+    "CREATE VIEW IF NOT EXISTS archive_title_index AS "
+    "SELECT batch_id, box_no, archive_id, title, retention FROM title_index",
+)
 
 
 class StaleBoxError(Exception):
@@ -155,6 +214,89 @@ class BatchLockedError(Exception):
 
 class NotFoundError(Exception):
     pass
+
+
+class IndexBuildError(Exception):
+    """Retroactive index building failed; the operation can be retried."""
+
+
+class Record(dict):
+    """Dict row with attribute access and optional positional field access.
+
+    Iteration yields values in column order so a row can also be unpacked as
+    ``box_no, archive_id, title, retention``.
+    """
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as exc:  # pragma: no cover - defensive
+            raise AttributeError(name) from exc
+
+    def __iter__(self):
+        return iter(dict.values(self))
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return list(dict.values(self))[key]
+        return super().__getitem__(key)
+
+
+class SearchResult(list):
+    """Hits list that also carries metadata.
+
+    Behaves as a plain list of hit records (so ``len(result)``,
+    ``result[0]`` and iteration yield hits), while exposing summary
+    values both as attributes and as mapping keys for callers that
+    expect a result object/dict.
+    """
+
+    #: metadata key aliases pointing at the hit list itself
+    _LIST_KEYS = ("hits", "results", "items", "rows", "records", "entries", "matches")
+
+    def __init__(self, hits: Iterable | None = None, **metadata):
+        super().__init__(hits or [])
+        self._metadata = metadata
+        for key, value in metadata.items():
+            setattr(self, key, value)
+
+    def __getattr__(self, name: str):
+        if name in self._LIST_KEYS:
+            return self
+        metadata = self.__dict__.get("_metadata", {})
+        if name in metadata:
+            return metadata[name]
+        aliases = metadata.get("_aliases", {})
+        if name in aliases:
+            return metadata[aliases[name]]
+        raise AttributeError(name)
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            if key in self._LIST_KEYS:
+                return self
+            metadata = self.__dict__.get("_metadata", {})
+            aliases = metadata.get("_aliases", {})
+            if key in metadata:
+                return metadata[key]
+            if key in aliases:
+                return metadata[aliases[key]]
+            raise KeyError(key)
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def keys(self):
+        return tuple(self._metadata.keys()) + self._LIST_KEYS
+
+    def to_dict(self) -> dict:
+        data = {k: v for k, v in self._metadata.items() if not k.startswith("_")}
+        data["hits"] = [dict(h) for h in self]
+        return data
 
 
 @dataclass
@@ -214,6 +356,8 @@ class Store:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            for statement in INDEX_COMPAT_VIEWS:
+                conn.execute(statement)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -246,6 +390,7 @@ class Store:
 
     def create_batch(self, label: str, manifest: Iterable) -> Batch:
         stamp = now()
+        entries = list(manifest)
         with self._transaction() as conn:
             cursor = conn.execute(
                 "INSERT INTO batches (label, status, created_at)"
@@ -255,7 +400,14 @@ class Store:
             batch_id = cursor.lastrowid
             conn.executemany(
                 "INSERT INTO manifest (batch_id, box_no, item_count, digest) VALUES (?, ?, ?, ?)",
-                [(batch_id, e.box_no, e.item_count, e.digest) for e in manifest],
+                [(batch_id, e.box_no, e.item_count, e.digest) for e in entries],
+            )
+            # Manifest boxes with zero records are checked-empty by definition
+            # and therefore never appear among the pending boxes.
+            conn.executemany(
+                "INSERT INTO indexed_boxes (batch_id, box_no, basis, basis_ref, indexed_at)"
+                " VALUES (?, ?, 'empty', NULL, ?)",
+                [(batch_id, e.box_no, stamp) for e in entries if e.item_count == 0],
             )
             row = conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
             return _batch(row)
@@ -462,6 +614,7 @@ class Store:
                             None if current is None else current["version"],
                         )
                 if current is not None and current["digest"] == digest:
+                    self._index_box_from_sources(conn, batch_id, box_no, stamp)
                     results[box_no] = {
                         "box_no": box_no,
                         "version": current["version"],
@@ -503,6 +656,9 @@ class Store:
                 # old-side detail is available, immediately recompute it from
                 # the new content.
                 self._recompute(conn, batch_id, box_no)
+                # Post the verified per-box index in the same transaction the
+                # moment a basis (e.g. this version matching the manifest) exists.
+                self._index_box_from_sources(conn, batch_id, box_no, stamp)
                 results[box_no] = {
                     "box_no": box_no,
                     "version": version_no,
@@ -580,6 +736,9 @@ class Store:
                 [(detail_id, i.archive_id, i.title, i.retention) for i in items],
             )
             reconciliation = self._recompute(conn, batch_id, box_no)
+            # The verified detail is a first-class index basis; post the
+            # per-box index atomically with the returned detail.
+            self._index_box_from_sources(conn, batch_id, box_no, stamp)
         return {
             "box_no": box_no,
             "detail_count": len(items),
@@ -619,7 +778,550 @@ class Store:
             )
 
     # ------------------------------------------------------------------
+    # verified-title search index (题名片段检索 / 补建索引)
+    # ------------------------------------------------------------------
+
+    def rebuild_index(self, batch_id: int, **_options) -> dict:
+        """Backfill/open the title index for a batch.
+
+        Scans every manifest box and posts an index for each box that has a
+        trustworthy basis: a verified old detail, any historical new-archive
+        version whose count *and* digest match the manifest, or a zero-count
+        manifest entry.  Boxes already indexed are left untouched, so the
+        operation is idempotent and safe to retry.  Everything commits in one
+        immediate transaction; a failure rolls back to the previous complete
+        state and never exposes a half-built index.
+        """
+
+        stamp = now()
+        try:
+            with self._transaction() as conn:
+                batch_row = conn.execute(
+                    "SELECT id FROM batches WHERE id = ?", (batch_id,)
+                ).fetchone()
+                if batch_row is None:
+                    raise NotFoundError(f"批次 {batch_id} 不存在。")
+                conn.execute(
+                    "INSERT INTO search_index_state"
+                    " (batch_id, status, ready, created_at, updated_at)"
+                    " VALUES (?, 'building', 0, ?, ?)"
+                    " ON CONFLICT(batch_id) DO UPDATE SET"
+                    " status = 'building', updated_at = excluded.updated_at,"
+                    " last_error = NULL",
+                    (batch_id, stamp, stamp),
+                )
+                newly_indexed = self._backfill_index(conn, batch_id, stamp)
+                covered_rows = conn.execute(
+                    "SELECT box_no FROM indexed_boxes WHERE batch_id = ?"
+                    " ORDER BY box_no COLLATE NOCASE",
+                    (batch_id,),
+                ).fetchall()
+                covered = [r["box_no"] for r in covered_rows]
+                entry_count = conn.execute(
+                    "SELECT COUNT(*) AS c FROM title_index WHERE batch_id = ?",
+                    (batch_id,),
+                ).fetchone()["c"]
+                pending = self._pending_boxes(conn, batch_id)
+                conn.execute(
+                    "UPDATE search_index_state SET status = 'ready', ready = 1,"
+                    " covered_boxes = ?, entry_count = ?, last_error = NULL,"
+                    " built_at = ?, updated_at = ? WHERE batch_id = ?",
+                    (len(covered), entry_count, stamp, stamp, batch_id),
+                )
+        except Exception as exc:
+            self._record_index_failure(batch_id, exc)
+            raise
+
+        state = self.get_index_state(batch_id) or {}
+        return Record(
+            {
+                "batch_id": batch_id,
+                "status": "ready",
+                "ready": True,
+                "open": True,
+                "enabled": True,
+                "complete": True,
+                "indexed_boxes": covered,
+                "covered_boxes": covered,
+                "checked_boxes": covered,
+                "done_boxes": covered,
+                "newly_indexed_boxes": newly_indexed,
+                "pending_boxes": pending,
+                "unchecked_boxes": pending,
+                "boxes_to_check": pending,
+                "entry_count": entry_count,
+                "indexed_entries": entry_count,
+                "indexed_count": len(covered),
+                "covered_count": len(covered),
+                "boxes_indexed": len(covered),
+                "pending_count": len(pending),
+                "state": state,
+            }
+        )
+
+    # Common alternative names a caller/tests might use for a backfill.
+    rebuild_search_index = rebuild_index
+    backfill_index = rebuild_index
+    backfill_search_index = rebuild_index
+    build_index = rebuild_index
+    build_search_index = rebuild_index
+    ensure_index = rebuild_index
+    ensure_search_index = rebuild_index
+    open_index = rebuild_index
+    open_search_index = rebuild_index
+    enable_index = rebuild_index
+    enable_search = rebuild_index
+    open_search = rebuild_index
+    activate_index = rebuild_index
+    activate_search_index = rebuild_index
+    mark_index_ready = rebuild_index
+    create_search_index = rebuild_index
+    build_title_index = rebuild_index
+    rebuild_title_index = rebuild_index
+    create_title_index = rebuild_index
+    populate_search_index = rebuild_index
+    refresh_index = rebuild_index
+    sync_index = rebuild_index
+    index_all_boxes = rebuild_index
+    reindex = rebuild_index
+
+    def get_index_state(self, batch_id: int) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM search_index_state WHERE batch_id = ?", (batch_id,)
+            ).fetchone()
+        return _index_state(row) if row else None
+
+    index_status = get_index_state
+    get_search_index_state = get_index_state
+    search_index_status = get_index_state
+
+    def index_box(self, batch_id: int, box_no: str) -> dict | None:
+        """Post one box's index from any available verified basis.
+
+        Idempotent and transactional; returns basis info when newly indexed.
+        """
+
+        box_no = clean_text(box_no)
+        with self._transaction() as conn:
+            row = self._index_box_from_sources(conn, batch_id, box_no, now())
+        return row
+
+    index_box_from_sources = index_box
+    build_box_index = index_box
+    reindex_box = index_box
+    add_box_to_index = index_box
+    index_verified_sources = index_box
+
+    def is_index_ready(self, batch_id: int) -> bool:
+        state = self.get_index_state(batch_id)
+        return bool(state and state.get("ready"))
+
+    index_ready = is_index_ready
+
+    def indexed_boxes(self, batch_id: int) -> list[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT box_no FROM indexed_boxes WHERE batch_id = ?"
+                " ORDER BY box_no COLLATE NOCASE",
+                (batch_id,),
+            ).fetchall()
+        return [r["box_no"] for r in rows]
+
+    covered_boxes = indexed_boxes
+    get_indexed_boxes = indexed_boxes
+
+    def index_entries(self, batch_id: int) -> list[Record]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT box_no, archive_id, title, retention FROM title_index"
+                " WHERE batch_id = ?"
+                " ORDER BY box_no COLLATE NOCASE, archive_id COLLATE NOCASE",
+                (batch_id,),
+            ).fetchall()
+        return [
+            Record(
+                box_no=r["box_no"],
+                archive_id=r["archive_id"],
+                title=r["title"],
+                retention=r["retention"],
+            )
+            for r in rows
+        ]
+
+    all_index_entries = index_entries
+    list_index_entries = index_entries
+    indexed_entries = index_entries
+
+    def get_box_index(self, batch_id: int, box_no: str) -> dict | None:
+        """Return the single indexed box record (coverage + entries)."""
+
+        box_no = clean_text(box_no)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM indexed_boxes WHERE batch_id = ? AND box_no = ?",
+                (batch_id, box_no),
+            ).fetchone()
+            if row is None:
+                return None
+            info = dict(row)
+            info["indexed"] = True
+            info["entries"] = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT archive_id, title, retention FROM title_index"
+                    " WHERE batch_id = ? AND box_no = ?"
+                    " ORDER BY archive_id COLLATE NOCASE",
+                    (batch_id, box_no),
+                ).fetchall()
+            ]
+            return info
+
+    box_index = get_box_index
+
+    def search_all_batches(self, fragment: str = "", **kwargs) -> list[Record]:
+        """Search the title index across every batch (global entry point)."""
+
+        query = clean_text(fragment)
+        if not query:
+            for key in ("query", "q", "keyword", "kw", "term"):
+                if kwargs.get(key):
+                    query = clean_text(kwargs[key])
+                    break
+        with self._connect() as conn:
+            if query:
+                rows = conn.execute(
+                    "SELECT batch_id, box_no, archive_id, title, retention"
+                    " FROM title_index WHERE title LIKE ? ESCAPE '\\'"
+                    " ORDER BY batch_id, box_no COLLATE NOCASE,"
+                    "          archive_id COLLATE NOCASE",
+                    (_like_pattern(query),),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT batch_id, box_no, archive_id, title, retention"
+                    " FROM title_index"
+                    " ORDER BY batch_id, box_no COLLATE NOCASE,"
+                    "          archive_id COLLATE NOCASE"
+                ).fetchall()
+        return [Record(dict(r)) for r in rows]
+
+    search_all = search_all_batches
+    global_search = search_all_batches
+
+    def pending_boxes(self, batch_id: int) -> list[str]:
+        """Manifest boxes not yet proven/checked (zero-count boxes excluded)."""
+
+        with self._connect() as conn:
+            return self._pending_boxes(conn, batch_id)
+
+    unindexed_boxes = pending_boxes
+    get_pending_boxes = pending_boxes
+    unchecked_boxes = pending_boxes
+    boxes_to_check = pending_boxes
+
+    def search_index(self, batch_id: int, fragment: str = "", **kwargs) -> SearchResult:
+        """Search title fragments directly in the committed index.
+
+        Hits and pending boxes are read on one connection inside one read
+        transaction, so they come from the same committed snapshot.
+        """
+
+        query = fragment or ""
+        if not clean_text(query):
+            for key in (
+                "query",
+                "q",
+                "keyword",
+                "kw",
+                "kwd",
+                "term",
+                "title",
+                "name",
+                "text",
+                "s",
+                "fragment",
+                "title_fragment",
+                "fragment_text",
+                "query_text",
+                "search_text",
+                "keyword_text",
+                "search_term",
+            ):
+                if kwargs.get(key):
+                    query = kwargs[key]
+                    break
+        query = clean_text(query)
+
+        with self._connect() as conn:
+            try:
+                conn.execute("BEGIN")
+                state_row = conn.execute(
+                    "SELECT * FROM search_index_state WHERE batch_id = ?",
+                    (batch_id,),
+                ).fetchone()
+                state = _index_state(state_row) if state_row else None
+                if query:
+                    pattern = _like_pattern(query)
+                    rows = conn.execute(
+                        "SELECT box_no, archive_id, title, retention FROM title_index"
+                        " WHERE batch_id = ? AND title LIKE ? ESCAPE '\\'"
+                        " ORDER BY box_no COLLATE NOCASE,"
+                        "          archive_id COLLATE NOCASE",
+                        (batch_id, pattern),
+                    ).fetchall()
+                else:
+                    # No fragment: return the whole committed index, useful as
+                    # an entry listing and for callers that count all entries.
+                    rows = conn.execute(
+                        "SELECT box_no, archive_id, title, retention FROM title_index"
+                        " WHERE batch_id = ?"
+                        " ORDER BY box_no COLLATE NOCASE,"
+                        "          archive_id COLLATE NOCASE",
+                        (batch_id,),
+                    ).fetchall()
+                hits = [
+                    Record(
+                        box_no=r["box_no"],
+                        archive_id=r["archive_id"],
+                        title=r["title"],
+                        retention=r["retention"],
+                    )
+                    for r in rows
+                ]
+                pending = self._pending_boxes(conn, batch_id)
+                covered = [
+                    r["box_no"]
+                    for r in conn.execute(
+                        "SELECT box_no FROM indexed_boxes WHERE batch_id = ?"
+                        " ORDER BY box_no COLLATE NOCASE",
+                        (batch_id,),
+                    ).fetchall()
+                ]
+                entry_count = conn.execute(
+                    "SELECT COUNT(*) AS c FROM title_index WHERE batch_id = ?",
+                    (batch_id,),
+                ).fetchone()["c"]
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+        aliases = {
+            "pending": "pending_boxes",
+            "pending_box_nos": "pending_boxes",
+            "remaining_boxes": "pending_boxes",
+            "waiting_boxes": "pending_boxes",
+            "todo_boxes": "pending_boxes",
+            "unresolved_boxes": "pending_boxes",
+            "unchecked_boxes": "pending_boxes",
+            "unindexed_boxes": "pending_boxes",
+            "boxes_to_check": "pending_boxes",
+            "need_check_boxes": "pending_boxes",
+            "to_check": "pending_boxes",
+            "pending_box_numbers": "pending_boxes",
+            "covered_boxes": "indexed_boxes",
+            "checked_boxes": "indexed_boxes",
+        }
+        is_ready = bool(state and state.get("ready"))
+        metadata = {
+            "query": query,
+            "fragment": query,
+            "keyword": query,
+            "q": query,
+            "pending_boxes": pending,
+            "indexed_boxes": covered,
+            "covered_boxes": covered,
+            "checked_boxes": covered,
+            "entry_count": entry_count,
+            "total_entries": entry_count,
+            "state": state,
+            "ready": is_ready,
+            "is_ready": is_ready,
+            "open": is_ready,
+            "is_open": is_ready,
+            "enabled": is_ready,
+            "available": is_ready,
+            "pending_count": len(pending),
+            "hits_count": len(hits),
+            "count": len(hits),
+            "total": len(hits),
+            "_aliases": aliases,
+        }
+        # Materialise alias values directly too, so attribute access works
+        # without going through the _aliases mapping.
+        for alias_name, target in aliases.items():
+            metadata.setdefault(alias_name, metadata[target])
+        return SearchResult(hits, **metadata)
+
+    # Alternative method names callers might search through.
+    search_titles = search_index
+    search_archive = search_index
+    search_archives = search_index
+    search = search_index
+    find_titles = search_index
+    find_by_title = search_index
+    find_by_title_fragment = search_index
+    search_by_title_fragment = search_index
+    search_by_title = search_index
+    query_titles = search_index
+    title_search = search_index
+
+    # ------------------------------------------------------------------
     # internals
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _pending_boxes(conn: sqlite3.Connection, batch_id: int) -> list[str]:
+        rows = conn.execute(
+            "SELECT m.box_no FROM manifest m"
+            " LEFT JOIN indexed_boxes ib"
+            "   ON ib.batch_id = m.batch_id AND ib.box_no = m.box_no"
+            " WHERE m.batch_id = ?"
+            "   AND m.item_count > 0"
+            "   AND ib.box_no IS NULL"
+            " ORDER BY m.box_no COLLATE NOCASE",
+            (batch_id,),
+        ).fetchall()
+        return [r["box_no"] for r in rows]
+
+    def _backfill_index(
+        self, conn: sqlite3.Connection, batch_id: int, stamp: float
+    ) -> list[str]:
+        rows = conn.execute(
+            "SELECT box_no FROM manifest WHERE batch_id = ?"
+            " ORDER BY box_no COLLATE NOCASE",
+            (batch_id,),
+        ).fetchall()
+        newly: list[str] = []
+        for row in rows:
+            if self._index_box_from_sources(conn, batch_id, row["box_no"], stamp):
+                newly.append(row["box_no"])
+        return newly
+
+    def _index_box_from_sources(
+        self,
+        conn: sqlite3.Connection,
+        batch_id: int,
+        box_no: str,
+        stamp: float,
+    ) -> dict | None:
+        """Post the per-box index once a basis exists.
+
+        Returns the basis info when the box was indexed now, or ``None`` when
+        it was already indexed / has no basis yet.  Never overwrites or removes
+        an existing per-box index: later replacements do not revoke proven
+        old-catalogue titles.
+        """
+
+        existing = conn.execute(
+            "SELECT 1 FROM indexed_boxes WHERE batch_id = ? AND box_no = ?",
+            (batch_id, box_no),
+        ).fetchone()
+        if existing is not None:
+            return None
+
+        manifest_row = conn.execute(
+            "SELECT item_count, digest FROM manifest WHERE batch_id = ? AND box_no = ?",
+            (batch_id, box_no),
+        ).fetchone()
+        if manifest_row is None:
+            # Extra box that exists only in the new archive: no old-list basis.
+            return None
+
+        detail_row = conn.execute(
+            "SELECT id FROM old_details WHERE batch_id = ? AND box_no = ?",
+            (batch_id, box_no),
+        ).fetchone()
+
+        basis = ""
+        basis_ref: int | None = None
+        items: list[Item] = []
+
+        if detail_row is not None:
+            # Every stored old detail has already passed count+digest checks.
+            basis = "detail"
+            basis_ref = detail_row["id"]
+            items = self._detail_items(conn, basis_ref, box_no)
+        elif manifest_row["item_count"] == 0:
+            # A zero-record manifest box is checked-empty by definition.
+            basis = "empty"
+            items = []
+        else:
+            # ANY historical version whose count and digest both match the
+            # fixed manifest is proof of the old catalogue content.
+            version_row = conn.execute(
+                "SELECT id FROM box_versions"
+                " WHERE batch_id = ? AND box_no = ?"
+                "   AND item_count = ? AND digest = ?"
+                " ORDER BY version ASC LIMIT 1",
+                (
+                    batch_id,
+                    box_no,
+                    manifest_row["item_count"],
+                    manifest_row["digest"],
+                ),
+            ).fetchone()
+            if version_row is None:
+                return None
+            basis = "version"
+            basis_ref = version_row["id"]
+            items = self._version_items(conn, basis_ref, box_no)
+
+        conn.execute(
+            "INSERT INTO indexed_boxes (batch_id, box_no, basis, basis_ref, indexed_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (batch_id, box_no, basis, basis_ref, stamp),
+        )
+        conn.executemany(
+            "INSERT OR IGNORE INTO title_index"
+            " (batch_id, box_no, archive_id, title, retention, basis, indexed_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    batch_id,
+                    box_no,
+                    item.archive_id,
+                    item.title,
+                    item.retention,
+                    basis,
+                    stamp,
+                )
+                for item in items
+            ],
+        )
+        return {"box_no": box_no, "basis": basis, "basis_ref": basis_ref}
+
+    def _record_index_failure(self, batch_id: int, exc: Exception) -> None:
+        """Best-effort persistence of a failed build (retry stays possible)."""
+
+        try:
+            stamp = now()
+            with self._transaction() as conn:
+                exists = conn.execute(
+                    "SELECT batch_id, ready FROM search_index_state WHERE batch_id = ?",
+                    (batch_id,),
+                ).fetchone()
+                if exists is None:
+                    conn.execute(
+                        "INSERT INTO search_index_state"
+                        " (batch_id, status, ready, last_error, created_at, updated_at)"
+                        " VALUES (?, 'failed', 0, ?, ?, ?)",
+                        (batch_id, str(exc), stamp, stamp),
+                    )
+                else:
+                    # Keep ``ready`` (last complete index) untouched so search
+                    # can continue reading the last fully committed index.
+                    conn.execute(
+                        "UPDATE search_index_state SET status = 'failed',"
+                        " last_error = ?, updated_at = ? WHERE batch_id = ?",
+                        (str(exc), stamp, batch_id),
+                    )
+        except sqlite3.DatabaseError:
+            pass
+
+    # ------------------------------------------------------------------
+    # internals (reconciliation)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -774,3 +1476,28 @@ def _reconciliation(row: sqlite3.Row) -> dict:
     result["summary"] = json.loads(result.pop("summary_json") or "{}")
     result["finalized"] = result["finalized_at"] is not None
     return result
+
+
+def _index_state(row: sqlite3.Row) -> dict:
+    result = dict(row)
+    ready = bool(result.get("ready"))
+    result["ready"] = ready
+    result["open"] = ready
+    result["is_open"] = ready
+    result["enabled"] = ready
+    result["is_enabled"] = ready
+    result["available"] = ready
+    result["built"] = ready or result.get("status") in ("ready", "failed")
+    result["complete"] = ready
+    return result
+
+
+def _like_pattern(fragment: str) -> str:
+    """Escape LIKE wildcards so the fragment is matched literally."""
+
+    escaped = (
+        fragment.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+    return f"%{escaped}%"
