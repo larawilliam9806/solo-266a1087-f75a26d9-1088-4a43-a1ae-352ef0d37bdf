@@ -1,0 +1,218 @@
+{% extends "base.html" %}
+{% block title %}盒 {{ box.box_no }} · 迁库题录对账{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>盒 {{ box.box_no }}</h1>
+    <p class="muted">
+      <a href="{{ url_for('board', batch_id=batch.id) }}">← 返回批次 #{{ batch.id }} 分盒清单</a>
+      · <span class="status">{{ box.status_label }}</span>
+      {% if box.finalized %}<span class="pill pill-done">已确认</span>{% endif %}
+    </p>
+  </div>
+</div>
+
+{% if box.is_extra_box %}
+<section class="card warn-callout">
+  <h2>多录：此盒只在新库存在</h2>
+  <p>旧库清单没有此盒，无需回旧库调明细。请核实是否为新库误增的盒。</p>
+</section>
+{% endif %}
+
+<section class="grid-2">
+  <div class="card">
+    <h2>旧库清单（固定）</h2>
+    {% if box.in_manifest %}
+    <dl class="facts">
+      <dt>条数</dt><dd>{{ box.manifest_count }}</dd>
+      <dt>SHA-256 摘要</dt><dd class="mono wrap">{{ box.manifest_digest }}</dd>
+    </dl>
+    {% else %}
+    <p class="muted">清单中没有此盒。</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>新库当前题录</h2>
+    {% if box.in_new %}
+    <dl class="facts">
+      <dt>条数</dt><dd>{{ box.new_count }}</dd>
+      <dt>摘要</dt><dd class="mono wrap">{{ box.new_digest }}</dd>
+      <dt>版本</dt><dd>第 {{ box.new_version }} 版{% if version %}（换交于 {{ version.imported_at|dt }}）{% endif %}</dd>
+    </dl>
+    {% else %}
+    <p class="muted">新库无此盒题录，按空盒比较（0 条）。</p>
+    {% endif %}
+  </div>
+</section>
+
+<section class="card">
+  <h2>回传旧库明细</h2>
+  {% if not box.in_manifest %}
+  <p class="muted">此盒不在旧库清单中，不需要回传明细。</p>
+  {% elif detail %}
+  <dl class="facts">
+    <dt>条数</dt><dd>{{ detail.item_count }}</dd>
+    <dt>摘要</dt><dd class="mono wrap">{{ detail.digest }}</dd>
+    <dt>接收时间</dt><dd>{{ detail.received_at|dt }}</dd>
+    <dt>清单校验</dt>
+    <dd>
+      {% if detail.item_count == box.manifest_count and detail.digest == box.manifest_digest %}
+        <span class="pill pill-ok">条数与摘要均相符</span>
+      {% else %}<span class="pill pill-danger">与清单不符</span>{% endif %}
+    </dd>
+  </dl>
+  {% else %}
+  <p><span class="pill pill-warn">须回旧库调明细</span>
+    明细回传后，系统先核对条数和 SHA-256 摘要；两者都与清单相符才会按档号列出漏录、多录和字段新旧值。</p>
+  {% endif %}
+
+  {% if batch.is_open and box.in_manifest %}
+  <form method="post" enctype="multipart/form-data"
+        action="{{ url_for('submit_detail', batch_id=batch.id, box_no=box.box_no) }}" class="grid-form">
+    <label>明细 CSV（盒号、盒内唯一档号、题名、保管期限）
+      <input type="file" name="detail" accept=".csv,text/csv" required>
+    </label>
+    <input type="hidden" name="expected_version_id" value="{{ expected_version_id }}">
+    <button type="submit">回传并核对明细</button>
+  </form>
+  <p class="hint">若该盒新库内容在页面打开后又换交过，本次回传会被拒绝，已有明细和结论保持原样。</p>
+  {% elif not batch.is_open %}
+  <p class="muted">批次已归档，不能回传或修改。</p>
+  {% endif %}
+</section>
+
+{% if reconciliation %}
+<section class="card">
+  <div class="page-head tight">
+    <h2>核对结论</h2>
+    <div class="actions">
+      <a class="button ghost" href="{{ url_for('differences_csv', batch_id=batch.id, box_no=box.box_no) }}">导出差异 CSV</a>
+      {% if batch.is_open and not reconciliation.finalized %}
+      <form method="post" action="{{ url_for('finalize_box', batch_id=batch.id, box_no=box.box_no) }}">
+        <input type="hidden" name="expected_version_id" value="{{ expected_version_id }}">
+        <button class="ghost" type="submit">确认此盒结论</button>
+      </form>
+      {% endif %}
+    </div>
+  </div>
+  <p class="outcome outcome-{{ reconciliation.outcome }}">{{ box.status_label }}</p>
+  <dl class="facts">
+    <dt>明细条数</dt><dd>{{ reconciliation.detail_count }}（清单 {{ box.manifest_count }}）</dd>
+    <dt>明细摘要</dt><dd class="mono wrap">{{ reconciliation.detail_digest }}</dd>
+    <dt>新库版本</dt><dd>{% if reconciliation.version %}第 {{ reconciliation.version }} 版{% else %}空盒（0 条）{% endif %}</dd>
+    <dt>漏录 / 多录 / 字段变更</dt>
+    <dd>{{ box.missing }} / {{ box.extra }} / {{ box.changed }}</dd>
+    <dt>生成时间</dt><dd>{{ reconciliation.updated_at|dt }}</dd>
+  </dl>
+
+  {% if differences %}
+  <h3>按档号的差异</h3>
+  <table class="diffs">
+    <thead>
+      <tr><th>档号</th><th>差异</th><th>字段</th><th>新库值</th><th>旧库值</th></tr>
+    </thead>
+    <tbody>
+      {% for difference in differences %}
+        {% if difference.kind == 'changed' %}
+          {% for field in difference.changes %}
+          <tr class="kind-changed">
+            <td class="mono">{{ difference.archive_id }}</td>
+            <td>{% if loop.first %}字段变更{% endif %}</td>
+            <td>{% if field == 'title' %}题名{% else %}保管期限{% endif %}</td>
+            <td>{% if field == 'title' %}{{ difference.new_title }}{% else %}{{ difference.new_retention }}{% endif %}</td>
+            <td>{% if field == 'title' %}{{ difference.old_title }}{% else %}{{ difference.old_retention }}{% endif %}</td>
+          </tr>
+          {% endfor %}
+        {% elif difference.kind == 'missing' %}
+          <tr class="kind-missing">
+            <td class="mono">{{ difference.archive_id }}</td>
+            <td>漏录</td>
+            <td>整条</td>
+            <td class="muted">—</td>
+            <td>题名={{ difference.old_title }}；保管期限={{ difference.old_retention }}</td>
+          </tr>
+        {% else %}
+          <tr class="kind-extra">
+            <td class="mono">{{ difference.archive_id }}</td>
+            <td>多录</td>
+            <td>整条</td>
+            <td>题名={{ difference.new_title }}；保管期限={{ difference.new_retention }}</td>
+            <td class="muted">—</td>
+          </tr>
+        {% endif %}
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="pill pill-ok">此盒逐档号核对一致。</p>
+  {% endif %}
+</section>
+{% endif %}
+
+{% if box.in_new and current_items %}
+<section class="card">
+  <h2>新库题录内容（第 {{ box.new_version }} 版）</h2>
+  <table class="diffs">
+    <thead><tr><th>档号</th><th>题名</th><th>保管期限</th></tr></thead>
+    <tbody>
+      {% for item in current_items %}
+      <tr><td class="mono">{{ item.archive_id }}</td><td>{{ item.title }}</td><td>{{ item.retention }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+{% if detail_items %}
+<section class="card">
+  <h2>旧库明细内容</h2>
+  <table class="diffs">
+    <thead><tr><th>档号</th><th>题名</th><th>保管期限</th></tr></thead>
+    <tbody>
+      {% for item in detail_items %}
+      <tr><td class="mono">{{ item.archive_id }}</td><td>{{ item.title }}</td><td>{{ item.retention }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+{% if batch.is_open %}
+<section class="card">
+  <h2>换交此盒题录</h2>
+  <p class="muted">
+    提交此盒完整题录即可换交。该盒内容一变，原差异立即撤下并按新内容重算；其他盒照常可查。
+    若该盒在本页打开后已变更，本次提交会被拒绝。
+  </p>
+  <form method="post" enctype="multipart/form-data"
+        action="{{ url_for('replace_box_items', batch_id=batch.id, box_no=box.box_no) }}" class="grid-form">
+    <label>该盒完整题录 CSV
+      <input type="file" name="items" accept=".csv,text/csv" required>
+    </label>
+    <input type="hidden" name="expected_version_id" value="{{ expected_version_id }}">
+    <button type="submit">换交该盒</button>
+  </form>
+  <p class="hint">当前基线版本：{% if box.new_version %}第 {{ box.new_version }} 版{% else %}尚无内容（0 条）{% endif %}。</p>
+</section>
+
+{% if versions|length > 1 %}
+<section class="card">
+  <h2>版本记录</h2>
+  <table class="diffs">
+    <thead><tr><th>版本</th><th>条数</th><th>摘要</th><th>接收时间</th></tr></thead>
+    <tbody>
+      {% for v in versions %}
+      <tr{% if v.version == box.new_version %} class="current"{% endif %}>
+        <td>第 {{ v.version }} 版{% if v.version == box.new_version %}（当前）{% endif %}</td>
+        <td>{{ v.item_count }}</td>
+        <td class="mono">{{ v.digest|shortdigest }}</td>
+        <td>{{ v.imported_at|dt }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+{% endif %}
+{% endblock %}

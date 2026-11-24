@@ -1,0 +1,25 @@
+services:
+  reconcile:
+    build: .
+    image: archive-reconcile:latest
+    container_name: archive-reconcile
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    environment:
+      ARCHIVE_DB: /data/reconcile.sqlite3
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
+      TZ: Asia/Shanghai
+      GUNICORN_WORKERS: "${GUNICORN_WORKERS:-1}"
+      GUNICORN_TIMEOUT: "${GUNICORN_TIMEOUT:-120}"
+    volumes:
+      - reconcile-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  reconcile-data:

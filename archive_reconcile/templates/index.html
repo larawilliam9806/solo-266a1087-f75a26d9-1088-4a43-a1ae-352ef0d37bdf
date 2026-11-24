@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}批次列表 · 迁库题录分盒对账{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>新建核对批次</h1>
+  <p class="muted">
+    一次导入固定的旧库清单（每盒条数与 SHA-256 摘要）和新库题录。清单中的盒若新库没有题录，按空盒比较；
+    只有新库有的盒直接列为多录。之后可随时按盒换交新题录，不打断其他盒。
+  </p>
+  <form method="post" action="{{ url_for('create_batch') }}" enctype="multipart/form-data" class="grid-form">
+    <label>批次名称
+      <input type="text" name="label" value="{{ label or '' }}" placeholder="例如：2026 年馆藏迁库第 1 批">
+    </label>
+    <label>旧库清单 CSV（盒号、条数、SHA-256 摘要）
+      <input type="file" name="manifest" accept=".csv,text/csv" required>
+    </label>
+    <label>新库题录 CSV（盒号、盒内唯一档号、题名、保管期限）
+      <input type="file" name="items" accept=".csv,text/csv" required>
+    </label>
+    <button type="submit">建立批次并分盒对账</button>
+  </form>
+</section>
+
+<section class="card">
+  <h1>批次</h1>
+  {% if batches %}
+  <table class="list">
+    <thead>
+      <tr><th>#</th><th>名称</th><th>状态</th><th>建立时间</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for batch in batches %}
+      <tr>
+        <td>{{ batch.id }}</td>
+        <td>{{ batch.label }}</td>
+        <td>
+          {% if batch.is_open %}<span class="pill pill-open">核对中</span>
+          {% else %}<span class="pill pill-done">已归档</span>{% endif %}
+        </td>
+        <td>{{ batch.created_at|dt }}</td>
+        <td><a href="{{ url_for('board', batch_id=batch.id) }}">进入分盒对账</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">还没有批次。先在上方导入清单和题录。</p>
+  {% endif %}
+</section>
+
+<section class="card muted-card">
+  <h2>CSV 写法</h2>
+  <p>题录列名可用：盒号 / 盒内唯一档号 / 题名 / 保管期限（也识别英文列名）。清单列名：盒号 / 条数 / SHA-256 摘要。</p>
+  <p>文件可用 UTF-8（含 BOM）、GB18030；CRLF 或 LF；字段可加引号；表头前可有少量说明行。摘要不受这些写法影响。</p>
+</section>
+{% endblock %}

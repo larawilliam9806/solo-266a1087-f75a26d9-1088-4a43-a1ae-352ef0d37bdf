@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block title %}批次 #{{ batch.id }} · 分盒对账{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>批次 #{{ batch.id }} · {{ batch.label }}</h1>
+    <p class="muted">
+      {% if batch.is_open %}<span class="pill pill-open">核对中</span>
+      {% else %}<span class="pill pill-done">已归档</span>{% endif %}
+      建立于 {{ batch.created_at|dt }}{% if batch.finalized_at %}，归档于 {{ batch.finalized_at|dt }}{% endif %}
+    </p>
+  </div>
+  <div class="actions">
+    <a class="button ghost" href="{{ url_for('report_csv', batch_id=batch.id) }}">导出对账汇总 CSV</a>
+    {% if batch.is_open %}
+    <form method="post" action="{{ url_for('finalize_batch', batch_id=batch.id) }}"
+          onsubmit="return confirm('归档后不能再换交题录或修改结论，确定？');">
+      <button class="ghost" type="submit">归档批次</button>
+    </form>
+    {% else %}
+    <form method="post" action="{{ url_for('reopen_batch', batch_id=batch.id) }}">
+      <button class="ghost" type="submit">重新打开</button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+
+<section class="stats">
+  <div class="stat"><span class="num">{{ board.counts.old_boxes }}</span><span>旧库清单盒</span></div>
+  <div class="stat"><span class="num">{{ board.counts.new_boxes }}</span><span>新库有题录盒</span></div>
+  <div class="stat warn"><span class="num">{{ board.counts.need_detail }}</span><span>须回旧库调明细</span></div>
+  <div class="stat danger"><span class="num">{{ board.counts.extra_boxes }}</span><span>多录盒（仅新库）</span></div>
+  <div class="stat"><span class="num">{{ board.counts.match }}</span><span>一致</span></div>
+  <div class="stat"><span class="num">{{ board.counts.differences }}</span><span>有差异</span></div>
+  <div class="stat"><span class="num">{{ board.counts.finalized }}</span><span>已确认盒</span></div>
+</section>
+
+{% if board.needs_detail %}
+<section class="card callout">
+  <h2>须回旧库调明细的盒（{{ board.needs_detail|length }}）</h2>
+  <p class="box-line">
+    {% for box_no in board.needs_detail %}
+      <a class="box-chip" href="{{ url_for('box_detail', batch_id=batch.id, box_no=box_no) }}">{{ box_no }}</a>
+    {% endfor %}
+  </p>
+</section>
+{% endif %}
+
+{% if board.extra_boxes %}
+<section class="card callout warn-callout">
+  <h2>多录盒：仅新库有、清单无此盒（{{ board.extra_boxes|length }}）</h2>
+  <p class="box-line">
+    {% for box_no in board.extra_boxes %}
+      <a class="box-chip chip-danger" href="{{ url_for('box_detail', batch_id=batch.id, box_no=box_no) }}">{{ box_no }}</a>
+    {% endfor %}
+  </p>
+</section>
+{% endif %}
+
+<section class="card">
+  <h2>分盒明细</h2>
+  <table class="board">
+    <thead>
+      <tr>
+        <th>盒号</th>
+        <th>状态</th>
+        <th>清单条数</th>
+        <th>新库条数</th>
+        <th>新库摘要</th>
+        <th>回传明细</th>
+        <th>漏录</th>
+        <th>多录</th>
+        <th>字段变更</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for box in board.boxes %}
+      <tr class="status-{{ box.status }}{% if box.finalized %} is-finalized{% endif %}">
+        <td><a href="{{ url_for('box_detail', batch_id=batch.id, box_no=box.box_no) }}">{{ box.box_no }}</a></td>
+        <td><span class="status">{{ box.status_label }}</span>{% if box.finalized %} <span class="pill pill-done">已确认</span>{% endif %}</td>
+        <td>{{ box.manifest_count if box.manifest_count is not none else '—' }}</td>
+        <td>{{ box.new_count if box.new_count is not none else '—' }}</td>
+        <td class="mono">{{ box.new_digest|shortdigest }}</td>
+        <td class="mono">
+          {% if box.has_detail %}{{ box.detail_count }} 条 · {{ box.detail_digest|shortdigest }}{% else %}—{% endif %}
+        </td>
+        <td>{{ box.missing or '' }}</td>
+        <td>{{ box.extra or '' }}</td>
+        <td>{{ box.changed or '' }}</td>
+        <td><a href="{{ url_for('box_detail', batch_id=batch.id, box_no=box.box_no) }}">查看</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+{% if batch.is_open %}
+<section class="card">
+  <h2>换交题录（不影响其他盒）</h2>
+  <p class="muted">
+    某一盒内容变动时，只需重新提交该盒的完整题录 CSV。系统会生成新版本、撤下该盒原差异并按新内容重算；
+    其他盒的结论不受影响。若提交时该盒已被别处更新，本次换交会被拒绝，原有数据保留。
+  </p>
+  <form method="post" id="replace-form" enctype="multipart/form-data"
+        action="{{ url_for('board', batch_id=batch.id) }}">
+    <label>盒号
+      <select id="replace-box" name="box_no_select" required>
+        <option value="" data-version="0">选择盒号</option>
+        {% for box in board.boxes %}
+        <option value="{{ box.box_no }}" data-version="{{ box.new_version_id }}">{{ box.box_no }}{% if box.in_manifest %}（清单）{% endif %}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>该盒完整题录 CSV
+      <input type="file" name="items" accept=".csv,text/csv" required>
+    </label>
+    <input type="hidden" name="expected_version_id" id="replace-version" value="0">
+    <button type="submit">换交该盒</button>
+  </form>
+</section>
+<script>
+(function () {
+  const form = document.getElementById('replace-form');
+  const select = document.getElementById('replace-box');
+  const version = document.getElementById('replace-version');
+  if (!form || !select) return;
+  const base = {{ url_for('board', batch_id=batch.id)|tojson }};
+  select.addEventListener('change', function () {
+    const option = select.options[select.selectedIndex];
+    version.value = option ? option.dataset.version || '0' : '0';
+  });
+  form.addEventListener('submit', function (event) {
+    const box = select.value;
+    if (!box) { event.preventDefault(); return; }
+    form.action = base.replace(/\/$/, '') + '/boxes/' + encodeURIComponent(box) + '/items';
+  });
+})();
+</script>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}迁库题录分盒对账{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="{{ url_for('index') }}">迁库题录 · 分盒对账</a>
+  <span class="tag">旧库明细按盒调阅</span>
+</header>
+<main>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <div class="flashes">
+        {% for category, message in messages %}
+          <div class="flash flash-{{ category }}">{{ message }}</div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  {% endwith %}
+  {% if error %}
+    <div class="flash flash-error" role="alert">{{ error }}</div>
+  {% endif %}
+  {% block content %}{% endblock %}
+</main>
+<footer>
+  <p>摘要口径：盒号 + 按档号排序的题录（含题名、保管期限）规范化 JSON 的 SHA-256；行序与等价 CSV 写法不影响摘要。</p>
+</footer>
+</body>
+</html>
